@@ -22,14 +22,11 @@ import { fetch } from "undici";
 import { fileURLToPath } from "node:url";
 
 /* =========================================================
-   OrderPilot – Production Menu-Aware Phone Agent (Pilot Ready)
-   Key upgrades:
-   - Slot-lock (pending_question) prevents repeated questions
-   - Unknown items blocked → clarify once → optional custom fallback
-   - Fast path heuristics; LLM extraction only when needed
-   - Edits reset confirmation and re-confirm updated draft
-   - Collection-only safe mode for week 1
-   - Backend timeout + 1 retry on timeout/network/5xx only
+   OrderPilot – Production Menu-Aware Phone Agent (Build-Safe)
+   FIXES:
+   - NEVER send ISO pickup_time to backend (only "ASAP" or "HH:MM")
+   - Prevent LLM from tool-calling create_order (we call tool execute directly)
+   - Backend timeout + 1 retry on timeout/network/5xx
    ========================================================= */
 
 /* =========================
@@ -78,11 +75,10 @@ type PendingQuestion = "item" | "name" | "time" | "pizza_size" | null;
 type OrderDraft = {
   service_type: ServiceType; // locked to collection for week 1
   customer_name: string | null;
-  pickup_time: string | null; // ASAP | HH:MM
+  pickup_time: string | null; // MUST be "ASAP" | "HH:MM" for backend
   items: DraftItem[];
   notes: string | null;
 
-  // Slot lock + unknown handling
   pending_question: PendingQuestion;
   reprompt_count: number;
 
@@ -103,7 +99,7 @@ const NO = /\b(no|nope|wrong|change|cancel|restart|start again|not that)\b/i;
 const MAX_TURN_CHARS = 240;
 
 /* =========================
-   Small Helpers
+   Helpers
 ========================= */
 
 function short(text: string): string {
@@ -182,6 +178,26 @@ function normalizeTime(input: string): string | null {
   return null;
 }
 
+/**
+ * Backend guardrail: ONLY "ASAP" or "HH:MM" allowed.
+ * If anything else (including ISO timestamps) -> fallback to ASAP.
+ */
+function ensureBackendPickupTime(value: string | null): string {
+  if (!value) return "ASAP";
+  const v = value.trim();
+
+  if (/^ASAP$/i.test(v)) return "ASAP";
+
+  const m = v.match(/^(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const hh = Math.min(23, Math.max(0, Number(m[1])));
+    const mm = Math.min(59, Math.max(0, Number(m[2])));
+    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+  }
+
+  return "ASAP";
+}
+
 function parsePizzaSize(text: string): PizzaSize | null {
   const t = text.toLowerCase();
   if (/(10\s*("|inch)\b|ten\s*inch)/.test(t)) return 10;
@@ -222,7 +238,7 @@ function fingerprintDraft(d: OrderDraft): string {
 function confirmSummary(d: OrderDraft): string {
   const items = d.items.map(formatItem).join(", ");
   const count = totalItemCount(d.items);
-  const time = d.pickup_time ?? "ASAP";
+  const time = ensureBackendPickupTime(d.pickup_time);
   const name = d.customer_name ?? "your name";
   return short(
     `Just to confirm: ${items}. Total ${count} item${count === 1 ? "" : "s"}. Collection at ${time}, under ${name}. Is that correct?`
@@ -398,9 +414,10 @@ function changeQtyByText(d: OrderDraft, text: string, qty: number): boolean {
   return true;
 }
 
-/* =========================
-   Slot Lock: Next Question
-========================= */
+function clearPending(d: OrderDraft) {
+  d.pending_question = null;
+  d.reprompt_count = 0;
+}
 
 function getNextQuestionAndSetPending(d: OrderDraft): string | null {
   if (d.pending_question) return null;
@@ -429,20 +446,14 @@ function getNextQuestionAndSetPending(d: OrderDraft): string | null {
   return null;
 }
 
-function clearPending(d: OrderDraft) {
-  d.pending_question = null;
-  d.reprompt_count = 0;
-}
-
 /* =========================
-   LLM Extraction (only when needed)
+   LLM parsing (optional) – no tools
 ========================= */
 
-const ExtractSchema = z.object({
+const ParseSchema = z.object({
   intent: z.enum(["order", "add", "remove", "change", "confirm", "cancel", "question", "unknown"]),
   name: z.string().nullable().optional(),
   pickup_time: z.string().nullable().optional(),
-  // We keep collection-only in production; delivery requests are handled but not set.
   raw_items: z
     .array(
       z.object({
@@ -465,60 +476,56 @@ const ExtractSchema = z.object({
   notes: z.string().nullable().optional(),
 });
 
-type Extraction = z.infer<typeof ExtractSchema>;
+type Parsed = z.infer<typeof ParseSchema>;
 
-function shouldUseLLM(text: string): boolean {
+function shouldUseLLM(text: string, draft: OrderDraft): boolean {
   const t = text.toLowerCase();
   if (YES.test(t) || NO.test(t)) return false;
   if (classifyFaq(t)) return false;
+  if (draft.pending_question) return false;
+  if (draft.pending_unknown_item) return false;
 
-  // If we are waiting for a slot answer, don't use LLM
-  // (handled by fast slot handlers)
-  // Caller giving multi-item orders / modifiers -> use LLM
   if (/(,| and | plus | also )/.test(t)) return true;
   if (/\b(no|without|extra|add|remove|change|instead)\b/.test(t)) return true;
   if (/\b(\d+|one|two|three|four|five)\b/.test(t) && t.split(/\s+/).length >= 5) return true;
 
-  return t.trim().split(/\s+/).length >= 8;
+  return t.trim().split(/\s+/).length >= 10;
 }
 
-async function extract(agent: OrderPilotAgent, input: string): Promise<Extraction | null> {
+async function parseWithLLM(session: voice.AgentSession<any>, text: string): Promise<Parsed | null> {
   try {
-    const res = await agent.run(
-      llm.extract({
-        schema: ExtractSchema,
-        input,
-        instructions: `
-Extract a UK takeaway call. Keep it simple.
+    const prompt = `
+Return ONLY valid JSON for this UK takeaway utterance.
 
-Return:
-- intent: order/add/remove/change/confirm/cancel/question/unknown
-- name if stated
-- pickup_time as spoken
-- raw_items: list of item phrases as spoken, with quantity, size if explicit (10/13/15), modifiers ("no onions", "extra spicy"), notes ("allergy")
-- remove_texts: item phrases to remove
-- change_qty: { text, quantity } if they change quantity
-- notes: global note like "paying cash"
+Keys:
+intent: order/add/remove/change/confirm/cancel/question/unknown
+name: string|null
+pickup_time: string|null (as spoken)
+raw_items: [{text, quantity, size(10/13/15|null), modifiers[], notes|null}]
+remove_texts: string[]
+change_qty: {text, quantity} | null
+notes: string|null
 
-Rules:
-- Yes/correct -> intent=confirm
-- Cancel/restart -> intent=cancel
-- Questions -> intent=question
-        `.trim(),
-      })
-    );
-    return res as Extraction;
+Utterance:
+${text}
+`.trim();
+
+    const reply = await session.chat({ messages: [{ role: "user", content: prompt }] });
+    const raw = typeof reply?.content === "string" ? reply.content : JSON.stringify(reply?.content ?? "");
+    const jsonText = raw.trim().replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+    const parsed = JSON.parse(jsonText);
+    return ParseSchema.parse(parsed);
   } catch {
     return null;
   }
 }
 
 /* =========================
-   Backend Tool (timeout + safe retry)
+   Backend tool (manual execute only)
 ========================= */
 
 const createOrderTool = llm.tool({
-  description: "Create a confirmed restaurant order in the OrderPilot backend. Use once after confirmation.",
+  description: "Create a confirmed restaurant order in the OrderPilot backend. Manual execute only.",
   parameters: z.object({
     customer_name: z.string(),
     service_type: z.enum(["collection", "delivery"]),
@@ -598,23 +605,23 @@ class OrderPilotAgent extends voice.Agent {
   lastConfirmFingerprint: string | null;
 
   constructor() {
+    // IMPORTANT: do NOT register create_order as an LLM tool
+    // This prevents the LLM from calling it and inventing ISO times.
     super({
       instructions: `
-You are the restaurant phone assistant. You sound like calm, efficient staff.
+You are the restaurant phone assistant. Sound like calm, efficient staff.
 
 STYLE:
 - Friendly, quick, confident.
-- Short sentences. One question at a time.
-- Never interrupt the caller. If unclear: “Sorry—what was the last item?”
+- Short answers. One question at a time.
 
 RULES:
-- COLLECTION ONLY for now. If delivery is asked, say staff will confirm.
-- Confirm with a brief itemised summary and total item count.
-- Allow edits: add/remove/change quantity/size/time/name/restart.
-- If an item is unclear or not on the menu, ask once to clarify.
-- If asked a question you don't know, answer politely and guide back to ordering.
+- COLLECTION ONLY.
+- Confirm once with an itemised summary.
+- Unknown items: clarify once; if still unclear, accept as "custom item" and continue.
+- If asked a question you don't know, answer politely and move back to ordering.
       `.trim(),
-      tools: { create_order: createOrderTool },
+      tools: {}, // <-- prevents LLM tool calls
     });
 
     this.draft = resetDraft();
@@ -653,7 +660,7 @@ export default defineAgent({
 
     const say = async (t: string) => session.say(short(t));
 
-    // Silence guard (reprompt once, then end)
+    // Silence guard
     let silenceTimer: NodeJS.Timeout | null = null;
     let silenceCount = 0;
     const resetSilence = () => {
@@ -665,7 +672,6 @@ export default defineAgent({
           resetSilence();
         } else {
           await say("No problem—call again when you’re ready. Bye.");
-          await session.end();
         }
       }, 12000);
     };
@@ -682,10 +688,10 @@ export default defineAgent({
       await say("Perfect—one second.");
 
       try {
-        const data = await (agent as any).tools.create_order.execute({
+        const data = await createOrderTool.execute({
           customer_name: agent.draft.customer_name!,
           service_type: "collection",
-          pickup_time: agent.draft.pickup_time!,
+          pickup_time: ensureBackendPickupTime(agent.draft.pickup_time),
           notes: agent.draft.notes ?? null,
           items: agent.draft.items.map((i) => ({
             item_name: [
@@ -705,7 +711,7 @@ export default defineAgent({
         agent.state = "completed";
         await say(orderId ? `All done—order confirmed. Order number ${orderId}.` : "All done—order confirmed.");
         await say("Thanks. Bye.");
-      } catch {
+      } catch (e: any) {
         agent.state = "completed";
         await say("Sorry—I couldn’t place that automatically just now. Please call again or speak to staff.");
       } finally {
@@ -715,38 +721,37 @@ export default defineAgent({
       }
     };
 
-    await say("Hi—OrderPilot live. What can I get you today?");
+    await say("Hi—OrderPilot. What can I get you today?");
 
-    session.on(voice.AgentSessionEventTypes.UserSpeechCommitted, async (ev: any) => {
+    session.on(voice.AgentSessionEventTypes.SpeechCommitted, async (ev: any) => {
       resetSilence();
       silenceCount = 0;
+
+      // Ignore agent speech
+      if (ev?.participant?.identity && String(ev.participant.identity).startsWith("agent-")) return;
 
       const text = clean(String(ev?.text || ""));
       if (!text || text.length < 2) return;
 
-      // 0) Fast FAQ handling
+      // FAQ
       const faq = classifyFaq(text);
       if (faq) {
         await say(`${FAQ[faq]} What would you like to order?`);
         return;
       }
 
-      // Delivery requested -> keep safe mode
+      // Delivery safe mode
       if (/\b(delivery|deliver)\b/i.test(text)) {
-        // lock to collection; do not capture address in week 1
         agent.draft.service_type = "collection";
         markDraftChanged();
         await say("No problem. I can take collection now—what would you like?");
         return;
       }
 
-      // 1) Confirmation yes/no
+      // Confirmation yes/no
       if (YES.test(text)) {
-        if (agent.state === "confirming") {
-          return placeOrder();
-        }
+        if (agent.state === "confirming") return placeOrder();
       }
-
       if (NO.test(text)) {
         if (/restart|start again/i.test(text)) {
           agent.draft = resetDraft();
@@ -765,9 +770,8 @@ export default defineAgent({
         }
       }
 
-      // 2) SLOT-LOCK FAST PATH: If we asked a specific question, only accept valid answers for it.
+      // Slot-lock fast path
       if (agent.draft.pending_question === "name") {
-        // accept short name-like replies without LLM
         const maybeName = text.split(/\s+/).slice(0, 3).join(" ");
         if (maybeName.length >= 2) {
           agent.draft.customer_name = maybeName;
@@ -775,9 +779,6 @@ export default defineAgent({
           markDraftChanged();
         } else {
           agent.draft.reprompt_count++;
-          if (agent.draft.reprompt_count >= 2) {
-            clearPending(agent.draft);
-          }
           await say("Sorry—what name is the order under?");
           return;
         }
@@ -786,12 +787,11 @@ export default defineAgent({
       if (agent.draft.pending_question === "time") {
         const nt = normalizeTime(text);
         if (nt) {
-          agent.draft.pickup_time = nt;
+          agent.draft.pickup_time = nt; // normalized to ASAP/HH:MM
           clearPending(agent.draft);
           markDraftChanged();
         } else {
           agent.draft.reprompt_count++;
-          if (agent.draft.reprompt_count >= 2) clearPending(agent.draft);
           await say("Sorry—ASAP, or a time like 19:30?");
           return;
         }
@@ -806,21 +806,21 @@ export default defineAgent({
           markDraftChanged();
         } else {
           agent.draft.reprompt_count++;
-          if (agent.draft.reprompt_count >= 2) clearPending(agent.draft);
           await say("Sorry—10, 13, or 15 inch?");
           return;
         }
       }
 
-      // 3) Heuristic time/name capture if not locked
+      // Heuristic time capture
       if (!agent.draft.pickup_time) {
         const nt = normalizeTime(text);
         if (nt) {
-          agent.draft.pickup_time = nt;
+          agent.draft.pickup_time = nt; // normalized
           markDraftChanged();
         }
       }
 
+      // Heuristic name capture
       if (!agent.draft.customer_name) {
         const m = text.match(/\b(it'?s|under|name is)\s+([a-zA-Z]{2,})\b/i);
         if (m?.[2]) {
@@ -829,7 +829,7 @@ export default defineAgent({
         }
       }
 
-      // 4) Edit intents: remove / change qty (try light heuristics first)
+      // Remove / qty edits
       const removeHit = text.match(/\b(remove|take off|delete)\s+(.*)$/i);
       if (removeHit?.[2]) {
         const ok = removeByText(agent.draft, removeHit[2]);
@@ -855,10 +855,8 @@ export default defineAgent({
         }
       }
 
-      // 5) Unknown item pending handling (clarify once; then custom fallback once)
+      // Unknown item pending
       if (agent.draft.pending_unknown_item) {
-        // They are answering our "what was that item?" question.
-        // Try matching this new text strongly.
         const matches = bestMenuMatches(text, 3);
         const top = matches[0];
         const score = top?.score ?? 0;
@@ -885,7 +883,6 @@ export default defineAgent({
         } else {
           agent.draft.pending_unknown_attempts += 1;
           if (agent.draft.pending_unknown_attempts >= 2) {
-            // Accept as custom item ONCE and move on
             upsertDraftItem(agent.draft, {
               category: "custom",
               canonical: nkey(agent.draft.pending_unknown_item),
@@ -908,24 +905,20 @@ export default defineAgent({
         }
       }
 
-      // 6) LLM extraction only if needed
-      let ex: Extraction | null = null;
-      if (shouldUseLLM(text) && !agent.draft.pending_question && !agent.draft.pending_unknown_item) {
-        ex = await extract(agent, text);
+      // Optional LLM parse (never tool calls)
+      let parsed: Parsed | null = null;
+      if (shouldUseLLM(text, agent.draft)) {
+        parsed = await parseWithLLM(session, text);
       }
 
-      if (ex?.intent === "question") {
-        // We only answer known FAQ; otherwise safe fallback
-        const fq = classifyFaq(text);
-        if (fq) {
-          await say(`${FAQ[fq]} What would you like to order?`);
-        } else {
-          await say("I’m not fully sure. I can take your order now—what would you like?");
-        }
+      if (parsed?.intent === "question") {
+        const fq2 = classifyFaq(text);
+        if (fq2) await say(`${FAQ[fq2]} What would you like to order?`);
+        else await say("I’m not fully sure. I can take your order now—what would you like?");
         return;
       }
 
-      if (ex?.intent === "cancel") {
+      if (parsed?.intent === "cancel") {
         agent.draft = resetDraft();
         agent.state = "drafting";
         agent.confirmAsked = false;
@@ -934,42 +927,42 @@ export default defineAgent({
         return;
       }
 
-      if (ex?.notes?.trim()) {
-        const n = ex.notes.trim();
+      if (parsed?.notes?.trim()) {
+        const n = parsed.notes.trim();
         agent.draft.notes = agent.draft.notes ? `${agent.draft.notes}; ${n}` : n;
         markDraftChanged();
       }
 
-      if (ex?.name?.trim()) {
-        agent.draft.customer_name = ex.name.trim();
+      if (parsed?.name?.trim()) {
+        agent.draft.customer_name = parsed.name.trim();
         clearPending(agent.draft);
         markDraftChanged();
       }
 
-      if (ex?.pickup_time && !agent.draft.pickup_time) {
-        const nt = normalizeTime(ex.pickup_time);
+      if (parsed?.pickup_time && !agent.draft.pickup_time) {
+        const nt = normalizeTime(parsed.pickup_time);
         if (nt) {
-          agent.draft.pickup_time = nt;
+          agent.draft.pickup_time = nt; // normalized
           clearPending(agent.draft);
           markDraftChanged();
         }
       }
 
-      if (ex?.remove_texts?.length) {
+      if (parsed?.remove_texts?.length) {
         let removed = false;
-        for (const r of ex.remove_texts) removed = removeByText(agent.draft, r) || removed;
+        for (const r of parsed.remove_texts) removed = removeByText(agent.draft, r) || removed;
         if (removed) markDraftChanged();
       }
 
-      if (ex?.change_qty?.text && ex.change_qty.quantity) {
-        const ok = changeQtyByText(agent.draft, ex.change_qty.text, ex.change_qty.quantity);
+      if (parsed?.change_qty?.text && parsed.change_qty.quantity) {
+        const ok = changeQtyByText(agent.draft, parsed.change_qty.text, parsed.change_qty.quantity);
         if (ok) markDraftChanged();
       }
 
-      // 7) Add items from extraction OR treat this as an item phrase
+      // Add items from parsed or treat as phrase
       const rawItems =
-        ex?.raw_items?.length
-          ? ex.raw_items
+        parsed?.raw_items?.length
+          ? parsed.raw_items
           : [
               {
                 text,
@@ -980,18 +973,12 @@ export default defineAgent({
               },
             ];
 
-      // If we are waiting for item, treat this input as items
-      if (agent.draft.pending_question === "item") {
-        // ok, proceed to add items below; then clear pending when at least one item is added
-      }
-
       let addedSomething = false;
 
       for (const r of rawItems) {
         const phrase = clean(r.text);
         if (!phrase) continue;
 
-        // Skip if this is clearly a name/time statement
         if (/^my name is\b/i.test(phrase)) continue;
         if (normalizeTime(phrase)) continue;
 
@@ -999,7 +986,6 @@ export default defineAgent({
         const top = matches[0];
         const score = top?.score ?? 0;
 
-        // Unknown item gate: do NOT add; ask clarifier once
         if (!matches.length || score < 0.32) {
           agent.draft.pending_unknown_item = phrase;
           agent.draft.pending_unknown_attempts = 0;
@@ -1009,7 +995,6 @@ export default defineAgent({
           return;
         }
 
-        // If mildly ambiguous, ask quick disambiguation, but still accept top choice to keep flow moving
         if (matches.length > 1 && score < 0.55) {
           await say(`Did you mean ${matches.map((m) => m.item.display).join(", ")}?`);
         }
@@ -1036,7 +1021,7 @@ export default defineAgent({
         clearPending(agent.draft);
       }
 
-      // 8) Slot fill: ask next missing piece (slot-locked)
+      // Ask next missing field
       const next = getNextQuestionAndSetPending(agent.draft);
       if (next) {
         agent.state = "drafting";
@@ -1044,7 +1029,7 @@ export default defineAgent({
         return;
       }
 
-      // 9) Confirm logic (re-confirm only if changed)
+      // Confirm
       const fp = fingerprintDraft(agent.draft);
 
       if (!agent.confirmAsked || agent.lastConfirmFingerprint !== fp) {
@@ -1055,16 +1040,15 @@ export default defineAgent({
         return;
       }
 
-      // 10) If they talk during confirming and it's not yes/no, treat as edit help
+      // Talking during confirming -> edit assist
       if (agent.state === "confirming" && !YES.test(text) && !NO.test(text)) {
         agent.state = "drafting";
         agent.confirmAsked = false;
         agent.lastConfirmFingerprint = null;
-        await say("No worries—tell me what to change. For example: add Coke, remove fries, or change the time.");
+        await say("No worries—tell me what to change. For example: add Coke, remove garlic dip, or change the time.");
         return;
       }
 
-      // If they said something but we didn’t need it, acknowledge briefly
       await say("Got it.");
     });
 
