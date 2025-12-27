@@ -715,7 +715,7 @@ export default defineAgent({
       }
     };
 
-    await say("Hi—what can I get you today?");
+    await say("Hi—OrderPilot live. What can I get you today?");
 
     session.on(voice.AgentSessionEventTypes.UserSpeechCommitted, async (ev: any) => {
       resetSilence();
