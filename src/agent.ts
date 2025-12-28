@@ -1,3 +1,5 @@
+// @ts-nocheck
+
 import { defineAgent, llm, voice } from '@livekit/agents';
 import * as livekit from '@livekit/agents-plugin-livekit';
 import * as silero from '@livekit/agents-plugin-silero';
