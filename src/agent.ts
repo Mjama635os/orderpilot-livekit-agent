@@ -1,59 +1,11 @@
-/**
- * OrderPilot LiveKit Voice Agent (Node.js)
- * Production-focused, low-latency restaurant ordering agent.
- *
- * - Uses LiveKit Agents (@livekit/agents) + LiveKit plugin turn detector + Silero VAD
- * - Uses LiveKit Inference model strings for STT/LLM/TTS (Deepgram/ElevenLabs/Cartesia/etc.)
- * - Uses LLM tool-calls to manage a small state machine (drafting → confirming → placing → completed)
- * - Posts orders to ORDERPILOT_ORDERS_URL with strict pickup_time formatting: "ASAP" or "HH:MM"
- */
+import { defineAgent, llm, voice } from '@livekit/agents';
+import * as livekit from '@livekit/agents-plugin-livekit';
+import * as silero from '@livekit/agents-plugin-silero';
+import { BackgroundVoiceCancellation } from '@livekit/noise-cancellation-node';
+import { z } from 'zod';
 
-import dotenv from "dotenv";
-dotenv.config({ path: ".env.local" });
-
-import { fetch } from "undici";
-import { z } from "zod";
-
-import {
-  ServerOptions,
-  cli,
-  defineAgent,
-  llm,
-  voice,
-} from "@livekit/agents";
-
-import * as livekit from "@livekit/agents-plugin-livekit";
-import * as silero from "@livekit/agents-plugin-silero";
-
-import { fileURLToPath } from "node:url";
-
-/* =========================
-   Env / Config
-========================= */
-
-const ORDERPILOT_ORDERS_URL = mustGetEnv("ORDERPILOT_ORDERS_URL"); // e.g. https://api.orderpilot.co.uk/orders
-const DEFAULT_RESTAURANT_ID = mustGetEnv("DEFAULT_RESTAURANT_ID");
-
-const RESTAURANT_NAME = process.env.RESTAURANT_NAME?.trim() || "the restaurant";
-const RESTAURANT_ADDRESS = process.env.RESTAURANT_ADDRESS?.trim() || ""; // optional for FAQs
-const RESTAURANT_PHONE = process.env.RESTAURANT_PHONE?.trim() || ""; // optional for handoff
-const RESTAURANT_OPENING_HOURS = process.env.RESTAURANT_OPENING_HOURS?.trim() || ""; // optional for FAQs
-
-// Models (use LiveKit Inference model strings)
-const LLM_MODEL = process.env.LLM_MODEL?.trim() || "openai/gpt-4.1-mini";
-const STT_MODEL = process.env.STT_MODEL?.trim() || "deepgram/nova-2-phonecall:en";
-// If you don't have Cartesia, use ElevenLabs (supported by LiveKit Inference).
-const TTS_MODEL = process.env.TTS_MODEL?.trim() || "elevenlabs/eleven_turbo_v2_5:default";
-
-// Menu: Provide either MENU_ITEMS (comma-separated) or MENU_JSON (array of strings / objects)
-const MENU_ITEMS = loadMenuItems();
-
-/* =========================
-   Types / State
-========================= */
-
-type ServiceType = "collection" | "delivery";
-type AgentState = "drafting" | "confirming" | "placing" | "completed";
+type ServiceType = 'collection' | 'delivery';
+type DraftState = 'drafting' | 'confirming' | 'placing' | 'completed';
 
 type DraftItem = {
   item_name: string;
@@ -63,673 +15,528 @@ type DraftItem = {
 };
 
 type OrderDraft = {
-  state: AgentState;
+  state: DraftState;
   service_type: ServiceType | null;
   customer_name: string | null;
-  pickup_time: string | null; // MUST be "ASAP" or "HH:MM"
+  pickup_time: string | null; // MUST be ASAP or HH:MM for your backend
   delivery_address: string | null;
   notes: string | null;
   items: DraftItem[];
+  last_question?: string | null;
 };
+
+type UserData = {
+  draft: OrderDraft;
+  // You can optionally set menu here (comma-separated env or fetched later)
+  menu: string[]; // canonical item names
+};
+
+const ORDERPILOT_ORDERS_URL = process.env.ORDERPILOT_ORDERS_URL || '';
+const RESTAURANT_ID = process.env.RESTAURANT_ID || '';
+const DEFAULT_SERVICE_TYPE = (process.env.DEFAULT_SERVICE_TYPE as ServiceType) || 'collection';
+
+// Model strings (LiveKit Cloud inference-supported providers)
+const STT_MODEL = process.env.STT_MODEL || 'deepgram/nova-2-phonecall:en';
+const TTS_MODEL = process.env.TTS_MODEL || 'elevenlabs/english_v1'; // set to your actual available TTS model
+const LLM_MODEL = process.env.LLM_MODEL || 'openai/gpt-4.1-mini';
+
+// Optional: provide known menu items as CSV in env MENU_ITEMS="Pepperoni Pizza,Margherita Pizza,Fries,Coke"
+const MENU_ITEMS = (process.env.MENU_ITEMS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 function newDraft(): OrderDraft {
   return {
-    state: "drafting",
-    service_type: "collection",
+    state: 'drafting',
+    service_type: DEFAULT_SERVICE_TYPE,
     customer_name: null,
-    pickup_time: "ASAP",
+    pickup_time: null,
     delivery_address: null,
     notes: null,
     items: [],
+    last_question: null,
   };
 }
 
-function mustGetEnv(key: string): string {
-  const v = process.env[key]?.trim();
-  if (!v) throw new Error(`Missing required env var: ${key}`);
-  return v;
+function clampQty(qty: number | undefined | null): number {
+  const n = Number(qty ?? 1);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(1, Math.min(50, Math.round(n)));
 }
 
-/* =========================
-   Helpers: Time normalization
-========================= */
+function normalizeText(s: string): string {
+  return s.trim().replace(/\s+/g, ' ');
+}
 
-function normalizePickupTime(input: unknown): string | null {
-  if (input === null || input === undefined) return null;
-  const raw = String(input).trim();
+function isHHMM(s: string): boolean {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
+}
+
+/**
+ * Converts common user time phrases into ASAP or HH:MM (24h).
+ * NOTE: This intentionally NEVER returns ISO timestamps because your backend rejects them.
+ */
+function normalizePickupTime(input: string): string | null {
+  const raw = normalizeText(input).toLowerCase();
   if (!raw) return null;
 
-  const s = raw.toLowerCase();
+  if (raw === 'asap' || raw.includes('asap') || raw.includes('now') || raw.includes('soonest')) {
+    return 'ASAP';
+  }
 
-  // ASAP
-  if (s === "asap" || s === "now" || s === "soon") return "ASAP";
+  // "in 20 minutes", "in 15 mins"
+  const rel = raw.match(/in\s+(\d{1,3})\s*(min|mins|minute|minutes)\b/);
+  if (rel) {
+    const mins = Math.max(0, Math.min(180, parseInt(rel[1]!, 10)));
+    const d = new Date();
+    d.setMinutes(d.getMinutes() + mins);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
 
-  // "in 20 minutes" -> "ASAP" (backend supports this phrase too, but keep stable)
-  if (/^in\s+\d+\s*(min|mins|minute|minutes)\b/.test(s)) return "ASAP";
+  // "7pm", "7 pm", "7:30pm", "19:00"
+  const hm =
+    raw.match(/^(\d{1,2})\s*:\s*(\d{2})\s*(am|pm)?$/) ||
+    raw.match(/^(\d{1,2})\s*(am|pm)$/);
+  if (hm) {
+    let h = parseInt(hm[1]!, 10);
+    let m = 0;
 
-  // "half seven" (UK) -> 19:30 by default if "seven" and no am/pm, assume evening for takeaways
-  if (s.includes("half") && (s.includes("seven") || s.includes("six") || s.includes("eight") || s.includes("nine"))) {
-    const hour = wordHourToNumber(s);
-    if (hour !== null) {
-      const hh = inferEveningHour(hour, s);
-      return `${String(hh).padStart(2, "0")}:30`;
+    if (hm.length >= 4 && hm[2] && hm[3]) {
+      // hh:mm am/pm
+      m = parseInt(hm[2]!, 10);
+      const ap = hm[3]!;
+      if (ap === 'pm' && h < 12) h += 12;
+      if (ap === 'am' && h === 12) h = 0;
+    } else if (hm.length === 3 && hm[2]) {
+      // hh am/pm
+      const ap = hm[2]!;
+      if (ap === 'pm' && h < 12) h += 12;
+      if (ap === 'am' && h === 12) h = 0;
+    } else if (hm.length >= 3 && hm[2] && !hm[3]) {
+      // hh:mm 24h
+      m = parseInt(hm[2]!, 10);
+    }
+
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
     }
   }
 
-  // HH:MM
-  const hhmm = raw.match(/^(\d{1,2}):(\d{2})$/);
-  if (hhmm) {
-    const hh = clampInt(Number(hhmm[1]), 0, 23);
-    const mm = clampInt(Number(hhmm[2]), 0, 59);
-    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+  // "half seven" / "half 7"
+  const half = raw.match(/half\s+(\d{1,2})/);
+  if (half) {
+    let h = parseInt(half[1]!, 10);
+    // assume "half seven" = 7:30 (UK)
+    if (h >= 1 && h <= 12) {
+      // heuristic: if caller says "half seven" on evening calls, likely PM; but we can’t guess reliably.
+      // Keep it simple: treat 1-11 as 19:30 if current hour >= 12, else 07:30.
+      const nowH = new Date().getHours();
+      if (nowH >= 12 && h < 12) h += 12;
+      return `${String(h).padStart(2, '0')}:30`;
+    }
   }
 
-  // "7pm" / "7 pm" / "7:30pm"
-  const ampm = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/);
-  if (ampm) {
-    let hh = clampInt(Number(ampm[1]), 0, 23);
-    const mm = clampInt(ampm[2] ? Number(ampm[2]) : 0, 0, 59);
-    const ap = ampm[3];
-    if (ap === "pm" && hh < 12) hh += 12;
-    if (ap === "am" && hh === 12) hh = 0;
-    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
-  }
-
-  // "7" or "7:30" without am/pm: assume evening for takeaways (17:00–23:00)
-  const bare = s.match(/^(\d{1,2})(?::(\d{2}))?$/);
-  if (bare) {
-    const hour = clampInt(Number(bare[1]), 0, 23);
-    const minute = clampInt(bare[2] ? Number(bare[2]) : 0, 0, 59);
-    const hh = inferEveningHour(hour, s);
-    return `${String(hh).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  }
-
-  // ISO timestamp: convert to HH:MM local time (server locale)
-  const d = new Date(raw);
-  if (!Number.isNaN(d.getTime())) {
-    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  // If user accidentally gave ISO like "2025-12-28T20:00:00.000Z"
+  // Convert to HH:MM (local server time).
+  const iso = Date.parse(input);
+  if (!Number.isNaN(iso)) {
+    const d = new Date(iso);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
   }
 
   return null;
 }
 
-function clampInt(n: number, min: number, max: number): number {
-  if (Number.isNaN(n)) return min;
-  return Math.min(max, Math.max(min, Math.trunc(n)));
-}
+function canonicalizeItemName(name: string, menu: string[]): { ok: true; canonical: string } | { ok: false; suggestions: string[] } {
+  const n = normalizeText(name);
+  if (!n) return { ok: false, suggestions: [] };
+  if (!menu.length) return { ok: true, canonical: n }; // if no menu configured, accept anything
 
-function inferEveningHour(hour: number, sLower: string): number {
-  // If user explicitly says morning/afternoon/evening, respect it
-  if (sLower.includes("am")) return hour === 12 ? 0 : hour;
-  if (sLower.includes("pm")) return hour < 12 ? hour + 12 : hour;
+  const lower = n.toLowerCase();
+  const exact = menu.find((m) => m.toLowerCase() === lower);
+  if (exact) return { ok: true, canonical: exact };
 
-  // Heuristic: assume evening (UK takeaways), so 7 -> 19, 8 -> 20, 9 -> 21, 10 -> 22, 11 -> 23
-  if (hour >= 1 && hour <= 11) return hour + 12;
-  return hour;
-}
-
-function wordHourToNumber(sLower: string): number | null {
-  const map: Record<string, number> = {
-    one: 1,
-    two: 2,
-    three: 3,
-    four: 4,
-    five: 5,
-    six: 6,
-    seven: 7,
-    eight: 8,
-    nine: 9,
-    ten: 10,
-    eleven: 11,
-    twelve: 12,
-  };
-  for (const k of Object.keys(map)) {
-    if (sLower.includes(k)) return map[k];
-  }
-  return null;
-}
-
-/* =========================
-   Helpers: Menu checks
-========================= */
-
-type MenuMatch = { ok: true; canonical: string } | { ok: false; reason: string; suggestions: string[] };
-
-function normalizeName(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function menuMatch(itemName: string): MenuMatch {
-  if (MENU_ITEMS.length === 0) {
-    // no menu configured, accept anything (v1)
-    return { ok: true, canonical: itemName };
-  }
-
-  const needle = normalizeName(itemName);
-  if (!needle) return { ok: false, reason: "empty", suggestions: [] };
-
-  // exact-ish contains match
-  const scored = MENU_ITEMS.map((m) => {
-    const hay = normalizeName(m);
-    const score =
-      hay === needle ? 100 :
-      hay.includes(needle) ? 70 :
-      needle.includes(hay) ? 60 :
-      tokenOverlapScore(needle, hay);
-    return { m, score };
-  })
-    .sort((a, b) => b.score - a.score)
+  // basic suggestion: contains or startswith
+  const sug = menu
+    .filter((m) => {
+      const ml = m.toLowerCase();
+      return ml.includes(lower) || lower.includes(ml) || ml.startsWith(lower) || lower.startsWith(ml);
+    })
     .slice(0, 5);
 
-  if (scored[0] && scored[0].score >= 65) return { ok: true, canonical: scored[0].m };
-
-  return {
-    ok: false,
-    reason: "not_on_menu",
-    suggestions: scored.filter((x) => x.score >= 35).map((x) => x.m).slice(0, 3),
-  };
+  return { ok: false, suggestions: sug };
 }
 
-function tokenOverlapScore(a: string, b: string): number {
-  const A = new Set(a.split(" ").filter(Boolean));
-  const B = new Set(b.split(" ").filter(Boolean));
-  if (A.size === 0 || B.size === 0) return 0;
-  let inter = 0;
-  for (const t of A) if (B.has(t)) inter++;
-  return Math.round((inter / Math.max(A.size, B.size)) * 50);
-}
-
-function loadMenuItems(): string[] {
-  const csv = process.env.MENU_ITEMS?.trim();
-  if (csv) return csv.split(",").map((s) => s.trim()).filter(Boolean);
-
-  const json = process.env.MENU_JSON?.trim();
-  if (json) {
-    try {
-      const parsed = JSON.parse(json);
-      if (Array.isArray(parsed)) {
-        return parsed
-          .map((x) => (typeof x === "string" ? x : (x?.name ?? x?.item_name ?? "")))
-          .map((s) => String(s).trim())
-          .filter(Boolean);
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  return [];
-}
-
-/* =========================
-   Confirmation summary
-========================= */
-
-function confirmOrderSummary(d: OrderDraft): string {
-  const parts: string[] = [];
-
-  const st = d.service_type ?? "collection";
-  parts.push(st === "delivery" ? "Delivery" : "Collection");
-
-  const t = d.pickup_time ?? "ASAP";
-  parts.push(t === "ASAP" ? "ASAP" : `for ${t}`);
-
-  if (d.customer_name) parts.push(`under ${d.customer_name}`);
-
-  const lines = d.items
-    .slice(0, 12)
+function summarizeDraft(d: OrderDraft): string {
+  const items = d.items
     .map((it) => {
-      const qty = it.quantity > 1 ? `${it.quantity}× ` : "";
-      const mods = it.modifiers?.length ? ` (${it.modifiers.join(", ")})` : "";
-      const note = it.special_instructions ? ` — ${it.special_instructions}` : "";
-      return `${qty}${it.item_name}${mods}${note}`.trim();
-    });
+      const mods = it.modifiers?.length ? ` (${it.modifiers.join(', ')})` : '';
+      const note = it.special_instructions ? ` [${it.special_instructions}]` : '';
+      return `${it.quantity} x ${it.item_name}${mods}${note}`;
+    })
+    .join('; ');
 
-  const totalCount = d.items.reduce((acc, it) => acc + (it.quantity || 0), 0);
+  const count = d.items.reduce((a, b) => a + (b.quantity || 0), 0);
+  const time = d.pickup_time || 'ASAP';
+  const name = d.customer_name || '—';
 
-  return `Just to confirm: ${parts.join(", ")}. Items: ${lines.join("; ")}. Total items: ${totalCount}. Shall I place it?`;
+  return `Name: ${name}. Time: ${time}. Items (${count}): ${items || '—'}.`;
 }
 
-function missingFields(d: OrderDraft): string[] {
-  const missing: string[] = [];
-  if (!d.service_type) missing.push("collection or delivery");
-  if (!d.customer_name) missing.push("your name");
-  if (!d.pickup_time) missing.push("pickup time");
-  if (!d.items.length) missing.push("your order");
-  if (d.service_type === "delivery" && !d.delivery_address) missing.push("delivery address");
-  return missing;
+function nextMissingQuestion(d: OrderDraft): string | null {
+  if (!d.items.length) return 'What can I get you today?';
+  if (!d.customer_name) return 'Can I get your name?';
+  if (!d.pickup_time) return 'What time for collection? You can say ASAP or a time like 7pm.';
+  return null;
 }
 
-/* =========================
-   LLM Extraction Schema
-========================= */
+async function postOrder(d: OrderDraft): Promise<{ ok: true; orderId?: string } | { ok: false; error: string }> {
+  if (!ORDERPILOT_ORDERS_URL) return { ok: false, error: 'ORDERPILOT_ORDERS_URL is not set' };
+  if (!RESTAURANT_ID) return { ok: false, error: 'RESTAURANT_ID is not set' };
 
-const Extracted = z.object({
-  intent: z.enum(["order", "add", "remove", "change", "confirm", "cancel", "question", "restart", "unknown"]).default("unknown"),
-  service_type: z.enum(["collection", "delivery"]).nullable().optional(),
-  customer_name: z.string().nullable().optional(),
-  pickup_time: z.string().nullable().optional(),
-  delivery_address: z.string().nullable().optional(),
-  notes: z.string().nullable().optional(),
-  // parsed items from user's utterance
-  items: z.array(z.object({
-    name: z.string(),
-    quantity: z.number().int().min(1).default(1),
-    modifiers: z.array(z.string()).default([]),
-    special_instructions: z.string().nullable().optional(),
-    // for remove/change
-    remove: z.boolean().optional(),
-  })).default([]),
-  // If user asked an FAQ, capture it so the agent can answer
-  question: z.string().nullable().optional(),
-});
-
-/* =========================
-   Tools
-========================= */
-
-const updateDraftTool = llm.tool({
-  description:
-    "Update the current order draft with extracted fields from the caller. Use this for adding/removing/changing items, name, time, service type, address, and notes. Always keep pickup_time as ASAP or HH:MM.",
-  parameters: Extracted,
-  execute: async (args, ctx) => {
-    const agent = ctx.session.agent as OrderPilotAgent;
-
-    // intent-based control
-    if (args.intent === "restart") {
-      agent.draft = newDraft();
-      return { ok: true, message: "draft_reset" };
-    }
-    if (args.intent === "cancel") {
-      agent.draft = newDraft();
-      agent.draft.state = "completed";
-      return { ok: true, message: "cancelled" };
-    }
-
-    // fields
-    if (args.service_type) agent.draft.service_type = args.service_type;
-    if (args.customer_name) agent.draft.customer_name = cleanName(args.customer_name);
-    if (args.delivery_address) agent.draft.delivery_address = args.delivery_address.trim();
-    if (args.notes !== undefined) agent.draft.notes = args.notes ?? null;
-
-    if (args.pickup_time) {
-      const norm = normalizePickupTime(args.pickup_time);
-      if (norm) agent.draft.pickup_time = norm;
-    }
-
-    // items: add/remove/change
-    if (args.items?.length) {
-      for (const it of args.items) {
-        const name = it.name?.trim();
-        if (!name) continue;
-
-        if (it.remove) {
-          // remove first matching item
-          const idx = agent.draft.items.findIndex((x) => normalizeName(x.item_name).includes(normalizeName(name)));
-          if (idx >= 0) agent.draft.items.splice(idx, 1);
-          continue;
-        }
-
-        // menu enforcement
-        const match = menuMatch(name);
-        if (!match.ok) {
-          // store as a "needs clarification" note and do not add
-          agent.pendingMenuClarification = {
-            requested: name,
-            suggestions: match.suggestions,
-          };
-          continue;
-        }
-
-        const canonical = match.canonical;
-
-        // if item exists, update quantity; else add
-        const existing = agent.draft.items.find((x) => normalizeName(x.item_name) === normalizeName(canonical));
-        const qty = clampInt(it.quantity ?? 1, 1, 99);
-
-        if (existing) {
-          existing.quantity = qty;
-          const mods = (it.modifiers ?? []).map((m) => m.trim()).filter(Boolean);
-          if (mods.length) existing.modifiers = uniq([...existing.modifiers, ...mods]);
-          if (it.special_instructions) existing.special_instructions = it.special_instructions;
-        } else {
-          agent.draft.items.push({
-            item_name: canonical,
-            quantity: qty,
-            modifiers: uniq((it.modifiers ?? []).map((m) => m.trim()).filter(Boolean)),
-            special_instructions: it.special_instructions ?? null,
-          });
-        }
-      }
-    }
-
-    // if user intends confirm, move to confirming when ready
-    if (args.intent === "confirm") agent.draft.state = "confirming";
-
-    return { ok: true, draft: agent.draft };
-  },
-});
-
-const createOrderTool = llm.tool({
-  description:
-    "Create a confirmed restaurant order in the OrderPilot backend. Use only after the user says yes to the confirmation.",
-  parameters: z.object({
-    customer_name: z.string(),
-    service_type: z.enum(["collection", "delivery"]),
-    pickup_time: z.string().describe('MUST be "ASAP" or "HH:MM" like "19:00".'),
-    delivery_address: z.string().nullable().optional(),
-    notes: z.string().nullable().optional(),
-    items: z.array(
-      z.object({
-        item_name: z.string(),
-        quantity: z.number().int().min(1),
-        unit_price: z.number().nullable().optional(),
-      }),
-    ),
-  }),
-  execute: async (args) => {
-    const payload = {
-      restaurant_id: DEFAULT_RESTAURANT_ID,
-      customer_name: cleanName(args.customer_name),
-      customer_phone: null,
-      pickup_time: normalizePickupTime(args.pickup_time) ?? "ASAP",
-      service_type: args.service_type,
-      notes: args.notes ?? null,
-      delivery_address: args.delivery_address ?? null,
-      items: args.items.map((i) => ({
-        item_name: i.item_name,
-        quantity: i.quantity,
-        unit_price: i.unit_price ?? null,
-      })),
-    };
-
-    // Hard guarantee format
-    if (payload.pickup_time !== "ASAP" && !/^\d{2}:\d{2}$/.test(payload.pickup_time)) {
-      payload.pickup_time = "ASAP";
-    }
-
-    const body = JSON.stringify(payload);
-
-    const attempt = async () => {
-      const res = await fetch(ORDERPILOT_ORDERS_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body,
-      });
-
-      const data = await res.json().catch(() => ({} as any));
-      if (!res.ok) {
-        throw new Error(`Order create failed ${res.status}: ${JSON.stringify(data)}`);
-      }
-      return data;
-    };
-
-    try {
-      const data = await withTimeout(attempt(), 10_000);
-      return { ok: true, order_id: data.order_id ?? data.id ?? null };
-    } catch (e1: any) {
-      // 1 retry
-      try {
-        const data = await withTimeout(attempt(), 10_000);
-        return { ok: true, order_id: data.order_id ?? data.id ?? null, retried: true };
-      } catch (e2: any) {
-        throw new Error(`Order create failed (after retry): ${e2?.message || e2}`);
-      }
-    }
-  },
-});
-
-const answerFaqTool = llm.tool({
-  description:
-    "Answer common restaurant questions (hours, address, payment, delivery vs collection, wait time). If unknown, be polite and offer to take the order anyway.",
-  parameters: z.object({
-    question: z.string(),
-  }),
-  execute: async ({ question }) => {
-    const q = question.toLowerCase();
-
-    if (q.includes("address") || q.includes("where") || q.includes("located")) {
-      if (RESTAURANT_ADDRESS) return { answer: `We’re at ${RESTAURANT_ADDRESS}.` };
-      return { answer: "I’m not seeing the full address here, but I can take your order now. Collection or delivery?" };
-    }
-
-    if (q.includes("open") || q.includes("close") || q.includes("opening") || q.includes("hours")) {
-      if (RESTAURANT_OPENING_HOURS) return { answer: `Our hours are: ${RESTAURANT_OPENING_HOURS}.` };
-      return { answer: "I don’t have the latest hours in front of me, but I can take your order now if you like." };
-    }
-
-    if (q.includes("cash") || q.includes("card") || q.includes("pay") || q.includes("payment")) {
-      return { answer: "Payment depends on the shop setup — I can take the order now and staff will confirm payment method at collection." };
-    }
-
-    if (q.includes("delivery") || q.includes("deliver")) {
-      return { answer: "We can do collection or delivery. Which would you like?" };
-    }
-
-    if (q.includes("how long") || q.includes("wait") || q.includes("ready") || q.includes("time")) {
-      return { answer: "Usually it’s around 15–25 minutes, but it can vary. Want it ASAP or for a specific time?" };
-    }
-
-    return { answer: "I can help with that as best I can — or I can take your order now. What would you like today?" };
-  },
-});
-
-/* =========================
-   Agent class
-========================= */
-
-class OrderPilotAgent extends voice.Agent {
-  draft: OrderDraft = newDraft();
-
-  // if user says an item not on menu, we pause and clarify instead of blindly accepting
-  pendingMenuClarification: null | { requested: string; suggestions: string[] } = null;
-
-  constructor() {
-    super({
-      instructions: systemPrompt(),
-      tools: [updateDraftTool, answerFaqTool, createOrderTool],
-    });
+  const pickup = d.pickup_time && isHHMM(d.pickup_time) ? d.pickup_time : d.pickup_time === 'ASAP' ? 'ASAP' : null;
+  if (!pickup) {
+    return { ok: false, error: 'Invalid time. Say "ASAP", "7pm", "in 20 minutes", or "19:00".' };
   }
-}
 
-function systemPrompt(): string {
-  const menuLine =
-    MENU_ITEMS.length > 0
-      ? `Menu is enforced. Only accept items that are on the menu list. If caller requests something not on menu, ask a quick clarification with 1–3 close suggestions, or ask them to choose another menu item.`
-      : `Menu is not configured. Accept free-form items.`;
+  const payload = {
+    restaurant_id: RESTAURANT_ID,
+    customer_name: d.customer_name,
+    customer_phone: null,
+    pickup_time: pickup,
+    service_type: d.service_type ?? DEFAULT_SERVICE_TYPE,
+    notes: d.notes,
+    items: d.items.map((it) => ({
+      item_name: it.item_name,
+      quantity: it.quantity,
+      unit_price: null,
+    })),
+  };
 
-  const addressLine = RESTAURANT_ADDRESS ? `Address: ${RESTAURANT_ADDRESS}.` : `Address: unknown.`;
-  const hoursLine = RESTAURANT_OPENING_HOURS ? `Opening hours: ${RESTAURANT_OPENING_HOURS}.` : `Opening hours: unknown.`;
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 8000);
 
-  return `
-You are OrderPilot, a premium phone order taker for ${RESTAURANT_NAME} in the UK.
-
-GOAL
-- Take orders fast and accurately.
-- Sound calm, confident, warm, and human — never robotic.
-- Minimal words. Ask only what you need.
-- Handle interruptions, accents, background noise. If unsure, confirm once.
-
-STATE MACHINE
-- drafting: collect service type, items, name, pickup time, address (delivery only).
-- confirming: give a single brief itemized summary + total count, then ask "Shall I place it?"
-- placing: call create_order tool once the caller clearly says yes.
-- completed: thank and end.
-
-RULES
-- Caller may give details in any order. Use update_draft tool to update fields every turn.
-- Support multi-item orders with quantities and simple modifiers (e.g. "no mayo", "extra spicy").
-- Allow edits: add/remove/change quantity/change time/change name/restart.
-- Confirm ONLY once per order (unless caller changes something after confirmation).
-- pickup_time must always be "ASAP" or "HH:MM" (e.g. "19:00"). Never send ISO timestamps.
-- If caller asks a question, answer briefly using answer_faq tool if needed, then return to the order.
-- If a required detail is missing, ask just one short question for the highest-priority missing field.
-- If menu is enforced and item isn't on menu, do NOT accept it — ask a quick clarification.
-
-${menuLine}
-${addressLine}
-${hoursLine}
-
-CONVERSATION STYLE
-- Opening: short greeting + one question.
-- Use UK phrasing (e.g., "What can I get you?", "collection or delivery?", "ASAP or a time?").
-- Do not ramble. 1 sentence responses when possible.
-
-TOOLS
-- update_draft: use to update draft with extracted fields and items. Use it EVERY turn.
-- answer_faq: use for opening hours/address/payment/delivery/wait time.
-- create_order: call only after clear confirmation. Pass items[] with item_name + quantity. Include notes if useful.
-
-IMPORTANT
-- If the user says something not on menu (and menu is enforced), ask: "We don’t have that — did you mean X, Y, or Z?"
-- If still unclear, ask them to choose from the menu.
-`.trim();
-}
-
-function cleanName(name: string): string {
-  return name.trim().replace(/\s+/g, " ").slice(0, 64);
-}
-
-function uniq(arr: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const s of arr) {
-    const k = s.toLowerCase();
-    if (!seen.has(k)) {
-      seen.add(k);
-      out.push(s);
-    }
-  }
-  return out;
-}
-
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  let t: any;
-  const timeout = new Promise<never>((_, rej) => {
-    t = setTimeout(() => rej(new Error("timeout")), ms);
-  });
   try {
-    return await Promise.race([p, timeout]);
+    const res = await fetch(ORDERPILOT_ORDERS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      return { ok: false, error: `Order create failed ${res.status}: ${text}` };
+    }
+
+    // best-effort parse
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+
+    const orderId = parsed?.order_id || parsed?.id;
+    return { ok: true, orderId: typeof orderId === 'string' ? orderId : undefined };
+  } catch (e: any) {
+    const msg = e?.name === 'AbortError' ? 'Timeout talking to OrderPilot backend' : String(e?.message || e);
+    return { ok: false, error: msg };
   } finally {
     clearTimeout(t);
   }
 }
 
-/* =========================
-   Agent Entrypoint
-========================= */
+const UpdateSchema = z.object({
+  intent: z
+    .enum(['order', 'add', 'remove', 'change', 'confirm', 'cancel', 'question', 'restart', 'unknown'])
+    .describe('User intent'),
+  service_type: z.enum(['collection', 'delivery']).optional(),
+  customer_name: z.string().optional(),
+  pickup_time: z.string().optional().describe('Raw time phrase like "7pm", "in 20 minutes", "ASAP"'),
+  delivery_address: z.string().optional(),
+  notes: z.string().optional(),
+  items: z
+    .array(
+      z.object({
+        name: z.string().describe('Menu item name as spoken'),
+        quantity: z.number().optional().describe('Quantity, default 1'),
+        modifiers: z.array(z.string()).optional().describe('Modifiers like "no mayo"'),
+        special_instructions: z.string().optional().describe('Any notes'),
+      })
+    )
+    .optional()
+    .describe('Items mentioned in this turn'),
+  remove_items: z.array(z.string()).optional().describe('Item names to remove'),
+});
 
-defineAgent({
-  entry: async (ctx: any) => {
-    const session = new voice.AgentSession({
-      // Voice pipeline components
-      llm: LLM_MODEL,
+class OrderPilotAgent extends voice.Agent<UserData> {
+  constructor() {
+    super({
+      instructions: `
+You are OrderPilot, a professional UK takeaway phone assistant.
+
+Goals:
+- Fast, natural, minimal words.
+- Take COLLECTION orders by default unless the user clearly wants delivery.
+- The user can give info in any order; you must handle interruptions.
+- You MUST always call the tool "update_order_draft" once per user turn BEFORE you respond, passing extracted fields.
+- Only confirm ONCE with a short itemised summary and ask for "yes" to place it.
+- After user confirms, call "create_order" exactly once. If it fails, retry once, then fallback politely.
+
+Time rule (CRITICAL):
+- pickup_time sent to backend MUST be "ASAP" or "HH:MM" (24h). Never send ISO.
+
+Menu rule:
+- If MENU_ITEMS is configured and the user asks for something not on the menu, do NOT accept it.
+  Offer 2-3 closest suggestions and ask what they'd like instead.
+
+FAQs:
+- If asked about address/hours/payment/wait time and unknown, say you’re not sure and offer to take the order anyway.
+
+Style:
+- Short replies. One question at a time.
+      `.trim(),
+
+      // Provide tools for the LLM to use
+      tools: {
+        update_order_draft: llm.tool({
+          description:
+            'Extract structured intent and fields from the user message and update the current OrderDraft. Always call this once per user turn before responding.',
+          parameters: UpdateSchema,
+          execute: async (args, { ctx }) => {
+            const ud = (ctx.session.userData ?? { draft: newDraft(), menu: MENU_ITEMS }) as UserData;
+            ctx.session.userData = ud;
+
+            const d = ud.draft;
+
+            // Intent handlers
+            if (args.intent === 'restart') {
+              ud.draft = newDraft();
+              return { ok: true, message: 'Order restarted.' };
+            }
+            if (args.intent === 'cancel') {
+              ud.draft.state = 'completed';
+              return { ok: true, message: 'Order cancelled.' };
+            }
+
+            if (args.service_type) d.service_type = args.service_type;
+            if (args.customer_name) d.customer_name = normalizeText(args.customer_name);
+            if (args.delivery_address) d.delivery_address = normalizeText(args.delivery_address);
+            if (typeof args.notes === 'string') d.notes = normalizeText(args.notes);
+
+            if (args.pickup_time) {
+              const norm = normalizePickupTime(args.pickup_time);
+              if (norm) d.pickup_time = norm;
+            }
+
+            // Remove items
+            if (args.remove_items?.length) {
+              const toRemove = args.remove_items.map((x) => x.toLowerCase());
+              d.items = d.items.filter((it) => !toRemove.some((r) => it.item_name.toLowerCase().includes(r)));
+            }
+
+            // Add / change items
+            if (args.items?.length) {
+              for (const rawItem of args.items) {
+                const name = normalizeText(rawItem.name);
+                if (!name) continue;
+
+                const match = canonicalizeItemName(name, ud.menu);
+                if (!match.ok) {
+                  // Signal to the LLM that this item is not on menu
+                  return {
+                    ok: false,
+                    not_on_menu: name,
+                    suggestions: match.suggestions,
+                  };
+                }
+
+                const canonical = match.canonical;
+                const qty = clampQty(rawItem.quantity ?? 1);
+                const mods = (rawItem.modifiers ?? []).map(normalizeText).filter(Boolean);
+
+                // If item exists, increase quantity (fast phone behavior)
+                const existing = d.items.find((x) => x.item_name.toLowerCase() === canonical.toLowerCase());
+                if (existing) {
+                  existing.quantity = clampQty((existing.quantity ?? 1) + qty);
+                  existing.modifiers = Array.from(new Set([...(existing.modifiers || []), ...mods])).filter(Boolean);
+                  if (rawItem.special_instructions) {
+                    existing.special_instructions = normalizeText(rawItem.special_instructions);
+                  }
+                } else {
+                  d.items.push({
+                    item_name: canonical,
+                    quantity: qty,
+                    modifiers: mods,
+                    special_instructions: rawItem.special_instructions ? normalizeText(rawItem.special_instructions) : null,
+                  });
+                }
+              }
+            }
+
+            // State transitions
+            if (args.intent === 'confirm') {
+              d.state = 'confirming';
+            } else if (d.state === 'confirming' && args.intent !== 'confirm') {
+              // user keeps talking; go back to drafting
+              d.state = 'drafting';
+            }
+
+            const missing = nextMissingQuestion(d);
+            d.last_question = missing;
+
+            return {
+              ok: true,
+              draft: {
+                state: d.state,
+                service_type: d.service_type,
+                customer_name: d.customer_name,
+                pickup_time: d.pickup_time,
+                delivery_address: d.delivery_address,
+                notes: d.notes,
+                items: d.items,
+              },
+              missing,
+              summary: summarizeDraft(d),
+            };
+          },
+        }),
+
+        create_order: llm.tool({
+          description:
+            'Create the order in OrderPilot backend. Only call after the user says yes to the confirmation.',
+          parameters: z.object({
+            confirm: z.boolean().describe('Must be true only when user confirmed the order'),
+          }),
+          execute: async ({ confirm }, { ctx }) => {
+            const ud = (ctx.session.userData ?? { draft: newDraft(), menu: MENU_ITEMS }) as UserData;
+            ctx.session.userData = ud;
+
+            if (!confirm) return { ok: false, error: 'Not confirmed' };
+
+            const d = ud.draft;
+
+            // Ensure minimum fields
+            const missing = nextMissingQuestion(d);
+            if (missing) {
+              return { ok: false, error: `Missing info: ${missing}` };
+            }
+
+            d.state = 'placing';
+
+            // 1st attempt
+            let res = await postOrder(d);
+            if (!res.ok) {
+              // retry once
+              res = await postOrder(d);
+            }
+
+            if (!res.ok) {
+              d.state = 'drafting';
+              return { ok: false, error: res.error };
+            }
+
+            d.state = 'completed';
+            return { ok: true, orderId: res.orderId ?? null };
+          },
+        }),
+
+        answer_faq: llm.tool({
+          description:
+            'Answer common restaurant FAQs (hours, address, payment, wait time). Use if asked. If unknown, say you’re not sure and offer to take the order.',
+          parameters: z.object({
+            question: z.string(),
+          }),
+          execute: async ({ question }) => {
+            // Keep this simple + safe; customize later
+            const q = question.toLowerCase();
+            if (q.includes('address')) {
+              const addr = process.env.RESTAURANT_ADDRESS;
+              return addr
+                ? { ok: true, answer: `We’re at ${addr}.` }
+                : { ok: false, answer: `I’m not sure of the exact address — but I can take your order now.` };
+            }
+            if (q.includes('open') || q.includes('hours') || q.includes('closing')) {
+              const hours = process.env.OPENING_HOURS;
+              return hours
+                ? { ok: true, answer: `Our opening hours are: ${hours}.` }
+                : { ok: false, answer: `I’m not sure of today’s hours — but I can take your order now.` };
+            }
+            if (q.includes('card') || q.includes('cash') || q.includes('pay')) {
+              const pay = process.env.PAYMENT_INFO;
+              return pay
+                ? { ok: true, answer: pay }
+                : { ok: false, answer: `I’m not 100% sure — but I can take the order and the shop will confirm on pickup.` };
+            }
+            if (q.includes('how long') || q.includes('wait') || q.includes('ready')) {
+              const wait = process.env.DEFAULT_WAIT_TIME;
+              return wait
+                ? { ok: true, answer: `Roughly ${wait}. Want it ASAP or a specific time?` }
+                : { ok: false, answer: `It depends on how busy it is — do you want it ASAP or a specific time?` };
+            }
+            return { ok: false, answer: `I’m not sure — but I can take your order now.` };
+          },
+        }),
+      },
+    });
+  }
+
+  override async onEnter() {
+    const session = this.session;
+    if (!session.userData) {
+      session.userData = { draft: newDraft(), menu: MENU_ITEMS } satisfies UserData;
+    }
+
+    // Short opening line
+    await session.say('Hi, OrderPilot here. What can I get you today?', { allowInterruptions: true });
+  }
+}
+
+export default defineAgent({
+  entry: async (ctx) => {
+    const vad = await silero.VAD.load();
+
+    const session = new voice.AgentSession<UserData>({
+      vad,
       stt: STT_MODEL,
+      llm: LLM_MODEL,
       tts: TTS_MODEL,
-      vad: new silero.VAD(),
-      // Turn detection (better endpointing on phone calls)
-      // NOTE: requires model files; ensure you run download-files in your build/deploy.
-      turnDetection: new livekit.turnDetector.MultilingualModel(),
-      // Keep it snappy
-      preemptiveGeneration: true,
-      // Reduce false interruptions
-      resumeFalseInterruption: true,
-    });
 
-    session.agent = new OrderPilotAgent();
+      // Turn detection model (requires weights) — keep it on for better phone UX
+      turnDetection: new livekit.turnDetector.EOUModel(),
 
-    // Start the session in the room
-    await session.start(ctx.room, ctx);
+      // Preemptive generation reduces perceived latency
+      voiceOptions: {
+        preemptiveGeneration: true,
+      },
 
-    // Greeting
-    await session.say("Hi, thanks for calling. Collection or delivery?", {
+      // Make interruptions feel natural on phone
       allowInterruptions: true,
-      addToChatCtx: true,
+
+      // Seed userData
+      userData: {
+        draft: newDraft(),
+        menu: MENU_ITEMS,
+      },
     });
 
-    // Runtime hooks: enforce menu clarification + keep flow tight
-    session.on(voice.AgentSessionEventTypes.FunctionToolsExecuted, async () => {
-      const agent = session.agent as OrderPilotAgent;
-
-      // If menu clarification is pending, ask immediately (and do NOT progress)
-      if (agent.pendingMenuClarification) {
-        const { requested, suggestions } = agent.pendingMenuClarification;
-        agent.pendingMenuClarification = null;
-
-        if (suggestions.length) {
-          await session.say(`We don’t have ${requested}. Did you mean ${suggestions.join(", ")}?`, {
-            allowInterruptions: true,
-            addToChatCtx: true,
-          });
-        } else {
-          await session.say(`We don’t have ${requested} on the menu. What would you like instead?`, {
-            allowInterruptions: true,
-            addToChatCtx: true,
-          });
-        }
-      }
+    await session.start({
+      room: ctx.room,
+      agent: new OrderPilotAgent(),
+      inputOptions: {
+        noiseCancellation: BackgroundVoiceCancellation(),
+      },
     });
 
-    // When user input is transcribed, drive state machine with short prompts
-    session.on(voice.AgentSessionEventTypes.UserInputTranscribed, async (ev: any) => {
-      const agent = session.agent as OrderPilotAgent;
-
-      // If already completed, ignore further input
-      if (agent.draft.state === "completed") return;
-
-      // If the LLM moved us to confirming, and required fields are present, speak summary
-      if (agent.draft.state === "confirming") {
-        const missing = missingFields(agent.draft);
-        if (missing.length) {
-          agent.draft.state = "drafting";
-          await session.say(`Quick one — what’s ${missing[0]}?`, { allowInterruptions: true, addToChatCtx: true });
-          return;
-        }
-
-        await session.say(confirmOrderSummary(agent.draft), { allowInterruptions: true, addToChatCtx: true });
-        return;
-      }
-
-      // If still drafting and missing fields, ask the single highest-priority missing field
-      if (agent.draft.state === "drafting") {
-        const missing = missingFields(agent.draft);
-        if (missing.length) {
-          // Keep it minimal; do not repeat if user already answered (LLM should update draft)
-          await session.say(`Great — what’s ${missing[0]}?`, { allowInterruptions: true, addToChatCtx: true });
-          return;
-        }
-
-        // If nothing missing, move to confirming (LLM can also do this)
-        agent.draft.state = "confirming";
-        await session.say(confirmOrderSummary(agent.draft), { allowInterruptions: true, addToChatCtx: true });
-      }
-    });
-
-    // Silence/no input handling: reprompt once, then end politely
-    let reprompted = false;
-    session.on(voice.AgentSessionEventTypes.MetricsCollected, async (m: any) => {
-      // Heuristic: if we see extended idle and haven't reprompted, do it
-      const idleMs = m?.vad?.idleTimeMs ?? m?.idleTimeMs ?? null;
-      if (typeof idleMs === "number" && idleMs > 18_000) {
-        if (!reprompted) {
-          reprompted = true;
-          await session.say("Sorry—are you still there? What would you like today?", { allowInterruptions: true, addToChatCtx: true });
-        } else {
-          await session.say("No problem. Please call again when you’re ready. Bye.", { allowInterruptions: false, addToChatCtx: false });
-          // Best-effort close: stop the session
-          try {
-            await session.close();
-          } catch {
-            // ignore
-          }
-        }
-      }
+    // Optional observability (no TS hard dependency on enums)
+    (session as any).on?.('close', () => {
+      // noop
     });
   },
 });
-
-/* =========================
-   Run as app (Local/Worker)
-========================= */
-
-cli.runApp(new ServerOptions({ agent: fileURLToPath(import.meta.url) }));
