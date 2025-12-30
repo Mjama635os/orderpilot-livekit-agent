@@ -501,6 +501,7 @@ Style:
 }
 
 export default defineAgent({
+  agentName: "orderpilot-phone-agent",
   entry: async (ctx) => {
     const vad = await silero.VAD.load();
 
@@ -509,19 +510,11 @@ export default defineAgent({
       stt: STT_MODEL,
       llm: LLM_MODEL,
       tts: TTS_MODEL,
-
-      // Turn detection model (requires weights) — keep it on for better phone UX
       turnDetection: new livekit.turnDetector.EOUModel(),
-
-      // Preemptive generation reduces perceived latency
       voiceOptions: {
         preemptiveGeneration: true,
       },
-
-      // Make interruptions feel natural on phone
       allowInterruptions: true,
-
-      // Seed userData
       userData: {
         draft: newDraft(),
         menu: MENU_ITEMS,
@@ -535,6 +528,9 @@ export default defineAgent({
         noiseCancellation: BackgroundVoiceCancellation(),
       },
     });
+  },
+});
+
 
     // Optional observability (no TS hard dependency on enums)
     (session as any).on?.('close', () => {
