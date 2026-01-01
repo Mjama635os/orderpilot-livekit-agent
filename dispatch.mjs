@@ -3,24 +3,59 @@ dotenv.config({ path: ".env.local" });
 
 import { AgentDispatchClient } from "livekit-server-sdk";
 
-const host = process.env.LIVEKIT_HOST;
-const apiKey = process.env.LIVEKIT_API_KEY;
-const apiSecret = process.env.LIVEKIT_API_SECRET;
-const agentName = process.env.AGENT_NAME || "orderpilot";
+/**
+ * REQUIRED ENV VARS
+ */
+const LIVEKIT_HOST = process.env.LIVEKIT_HOST; // e.g. https://xxxx.livekit.cloud
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 
-if (!host || !apiKey || !apiSecret) {
-  console.error("Missing LIVEKIT_HOST / LIVEKIT_API_KEY / LIVEKIT_API_SECRET");
-  console.error("Have:", {
-    LIVEKIT_HOST: host ? "set" : "missing",
-    LIVEKIT_API_KEY: apiKey ? "set" : "missing",
-    LIVEKIT_API_SECRET: apiSecret ? "set" : "missing",
+/**
+ * MUST MATCH defineAgent({ name: "orderpilot-phone-agent" })
+ */
+const AGENT_NAME =
+  process.env.AGENT_NAME || "orderpilot-phone-agent";
+
+/**
+ * Room to dispatch into
+ */
+const ROOM_NAME = process.argv[2] || "orderpilot-test";
+
+/**
+ * Validation
+ */
+if (!LIVEKIT_HOST || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+  console.error("❌ Missing LiveKit credentials");
+  console.error({
+    LIVEKIT_HOST: LIVEKIT_HOST ? "set" : "missing",
+    LIVEKIT_API_KEY: LIVEKIT_API_KEY ? "set" : "missing",
+    LIVEKIT_API_SECRET: LIVEKIT_API_SECRET ? "set" : "missing",
   });
   process.exit(1);
 }
 
-const roomName = process.argv[2] || "orderpilot-test";
+(async () => {
+  try {
+    const client = new AgentDispatchClient(
+      LIVEKIT_HOST,
+      LIVEKIT_API_KEY,
+      LIVEKIT_API_SECRET
+    );
 
-const client = new AgentDispatchClient(host, apiKey, apiSecret);
-const dispatch = await client.createDispatch(roomName, agentName);
+    const dispatch = await client.createDispatch(
+      ROOM_NAME,
+      AGENT_NAME
+    );
 
-console.log("Dispatched:", { roomName, agentName, dispatchId: dispatch.id });
+    console.log("✅ Dispatched agent successfully:");
+    console.log({
+      roomName: ROOM_NAME,
+      agentName: AGENT_NAME,
+      dispatchId: dispatch.id,
+    });
+  } catch (err) {
+    console.error("❌ Failed to dispatch agent");
+    console.error(err);
+    process.exit(1);
+  }
+})();

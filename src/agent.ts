@@ -22,6 +22,13 @@
 import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 
+console.log("BOOT ✅", {
+  STT_MODEL: process.env.STT_MODEL,
+  TTS_MODEL: process.env.TTS_MODEL,
+  hasDeepgram: !!process.env.DEEPGRAM_API_KEY,
+  hasEleven: !!process.env.ELEVENLABS_API_KEY,
+});
+
 import {
   type JobContext,
   type JobProcess,
@@ -500,7 +507,9 @@ Friendly, fast, not robotic. No long speeches.
 ========================================================= */
 
 export default defineAgent({
+  name: "orderpilot-phone-agent",
   prewarm: async (proc: JobProcess) => {
+
     proc.userData.vad = await silero.VAD.load();
   },
 
@@ -784,6 +793,6 @@ export default defineAgent({
 cli.runApp(
   new ServerOptions({
     agent: fileURLToPath(import.meta.url),
-    agentName: "orderpilot-phone-agent",
   })
 );
+
